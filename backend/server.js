@@ -9,9 +9,7 @@ const ffmpeg = require("fluent-ffmpeg");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({
-  origin: "*"
-}));
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 // ── Directories ──────────────────────────────────────────────
@@ -31,23 +29,21 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB total
+  limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ["video/mp4", "video/quicktime", "video/x-msvideo", "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav"];
     cb(null, allowed.includes(file.mimetype));
   },
 });
 
-// Attach jobId before multer runs
 app.use((req, res, next) => {
   req.jobId = uuidv4();
   next();
 });
 
-// ── Job status store (in-memory) ──────────────────────────────
 const jobs = {};
 
-// ── Helper: get video duration via ffprobe ────────────────────
+// ── Helper: get video duration ────────────────────────────────
 function getDuration(filePath) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, meta) => {
@@ -57,30 +53,18 @@ function getDuration(filePath) {
   });
 }
 
-// ── Helper: trim a single clip ────────────────────────────────
-function trimClip(input, output, start, duration) {
+// ── Helper: compress + trim a single clip (combined for speed) ─
+// Compresses to 720p CRF28 ultrafast — 4-5x faster than 1080p
+function compressAndTrim(input, output, start, duration) {
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .setStartTime(start)
       .setDuration(duration)
-      .outputOptions(["-c:v libx264", "-preset fast", "-crf 23", "-an"])
-      .output(output)
-      .on("end", resolve)
-      .on("error", reject)
-      .run();
-  });
-}
-
-// ── Helper: scale + pad clip to target aspect ratio ───────────
-function scaleClip(input, output, aspectRatio) {
-  const [w, h] = aspectRatio === "9:16" ? [1080, 1920] : [1080, 1080];
-  return new Promise((resolve, reject) => {
-    ffmpeg(input)
       .outputOptions([
-        `-vf scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black`,
+        "-vf scale=720:-2",       // Downscale to 720p (keeps aspect ratio)
         "-c:v libx264",
-        "-preset fast",
-        "-crf 22",
+        "-preset ultrafast",      // Much faster encode
+        "-crf 28",                // Slightly more compression — fine for social
         "-an",
       ])
       .output(output)
@@ -90,7 +74,26 @@ function scaleClip(input, output, aspectRatio) {
   });
 }
 
-// ── Helper: concatenate clips via concat demuxer ──────────────
+// ── Helper: scale + pad to target aspect ratio ────────────────
+function scaleClip(input, output, aspectRatio) {
+  const [w, h] = aspectRatio === "9:16" ? [1080, 1920] : [1080, 1080];
+  return new Promise((resolve, reject) => {
+    ffmpeg(input)
+      .outputOptions([
+        `-vf scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black`,
+        "-c:v libx264",
+        "-preset ultrafast",
+        "-crf 26",
+        "-an",
+      ])
+      .output(output)
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+}
+
+// ── Helper: concatenate clips ─────────────────────────────────
 function concatClips(clipPaths, output) {
   return new Promise((resolve, reject) => {
     const listFile = output + ".txt";
@@ -99,7 +102,7 @@ function concatClips(clipPaths, output) {
     ffmpeg()
       .input(listFile)
       .inputOptions(["-f concat", "-safe 0"])
-      .outputOptions(["-c:v libx264", "-preset fast", "-crf 22", "-an"])
+      .outputOptions(["-c:v libx264", "-preset ultrafast", "-crf 26", "-an"])
       .output(output)
       .on("end", () => { fs.unlinkSync(listFile); resolve(); })
       .on("error", (e) => { try { fs.unlinkSync(listFile); } catch {} reject(e); })
@@ -108,20 +111,20 @@ function concatClips(clipPaths, output) {
 }
 
 // ── Helper: mix music over video ─────────────────────────────
-function mixAudio(videoPath, musicPath, output, fadeOut = true) {
+function mixAudio(videoPath, musicPath, output) {
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(videoPath, (err, meta) => {
       if (err) return reject(err);
       const duration = meta.format.duration;
-
-      let audioFilter = `[1:a]volume=0.85`;
-      if (fadeOut) audioFilter += `,afade=t=out:st=${Math.max(0, duration - 2)}:d=2`;
-      audioFilter += `[music]`;
+      const fadeStart = Math.max(0, duration - 2);
 
       ffmpeg()
         .input(videoPath)
         .input(musicPath)
-        .complexFilter([audioFilter, `[music]anull[aout]`])
+        .complexFilter([
+          `[1:a]volume=0.85,afade=t=out:st=${fadeStart}:d=2[music]`,
+          `[music]anull[aout]`
+        ])
         .outputOptions([
           "-map 0:v",
           "-map [aout]",
@@ -140,41 +143,51 @@ function mixAudio(videoPath, musicPath, output, fadeOut = true) {
 }
 
 // ── Core reel builder ─────────────────────────────────────────
-async function buildReel({ jobId, clips, music, aspectRatio, clipDuration, pace }) {
+async function buildReel({ jobId, clips, music, aspectRatio, pace, reelDuration }) {
   const jobUploadDir = path.join(UPLOAD_DIR, jobId);
   const jobOutputDir = path.join(OUTPUT_DIR, jobId);
   fs.mkdirSync(jobOutputDir, { recursive: true });
 
   const updateJob = (update) => Object.assign(jobs[jobId], update);
 
-  // 1. Determine cut duration per clip based on pace
+  // Cut length per clip based on pace
   const cutDurations = { fast: 2.5, medium: 4, slow: 6 };
   const cutLen = cutDurations[pace] || 3;
 
-  updateJob({ status: "processing", progress: 10, message: "Analyzing clips..." });
+  // How many clips we need to fill the target reel duration
+  const targetSeconds = parseInt(reelDuration) || 30;
+  const clipsNeeded = Math.ceil(targetSeconds / cutLen);
+  
+  // Repeat clips if we don't have enough to fill duration
+  const expandedClips = [];
+  while (expandedClips.length < clipsNeeded) {
+    expandedClips.push(...clips);
+  }
+  const finalClips = expandedClips.slice(0, clipsNeeded);
 
-  // 2. Trim each clip
+  updateJob({ status: "processing", progress: 5, message: "Compressing clips for fast processing..." });
+
+  // 1. Compress + trim each clip (combined step = much faster)
   const trimmedPaths = [];
-  for (let i = 0; i < clips.length; i++) {
-    const clipPath = path.join(jobUploadDir, clips[i]);
+  for (let i = 0; i < finalClips.length; i++) {
+    const clipPath = path.join(jobUploadDir, finalClips[i]);
     const trimmed = path.join(jobOutputDir, `trimmed_${i}.mp4`);
 
     let duration;
     try { duration = await getDuration(clipPath); } catch { duration = 10; }
 
-    // Take the most energetic part (middle 60% of clip)
     const start = duration * 0.2;
     const safeLen = Math.min(cutLen, duration * 0.6);
 
-    await trimClip(clipPath, trimmed, start, safeLen);
+    await compressAndTrim(clipPath, trimmed, start, safeLen);
     trimmedPaths.push(trimmed);
 
-    updateJob({ progress: 10 + Math.round((i / clips.length) * 30) });
+    updateJob({ progress: 5 + Math.round((i / finalClips.length) * 35), message: `Compressing clip ${i + 1} of ${finalClips.length}...` });
   }
 
   updateJob({ progress: 40, message: "Scaling to format..." });
 
-  // 3. Scale each clip to target aspect ratio
+  // 2. Scale to aspect ratio
   const scaledPaths = [];
   for (let i = 0; i < trimmedPaths.length; i++) {
     const scaled = path.join(jobOutputDir, `scaled_${i}.mp4`);
@@ -185,13 +198,13 @@ async function buildReel({ jobId, clips, music, aspectRatio, clipDuration, pace 
 
   updateJob({ progress: 65, message: "Cutting the reel..." });
 
-  // 4. Concatenate all clips
+  // 3. Concatenate
   const concatenated = path.join(jobOutputDir, "concat.mp4");
   await concatClips(scaledPaths, concatenated);
 
   updateJob({ progress: 80, message: "Mixing music..." });
 
-  // 5. Mix music if provided
+  // 4. Mix music
   let finalVideo = concatenated;
   if (music) {
     const musicPath = path.join(jobUploadDir, music);
@@ -202,12 +215,12 @@ async function buildReel({ jobId, clips, music, aspectRatio, clipDuration, pace 
 
   updateJob({ progress: 95, message: "Finalizing..." });
 
-  // 6. Move to final output
-  const outputName = `reel_${aspectRatio.replace(":", "x")}_${Date.now()}.mp4`;
+  // 5. Output
+  const outputName = `reel_${aspectRatio.replace(":", "x")}_${targetSeconds}s_${Date.now()}.mp4`;
   const outputPath = path.join(jobOutputDir, outputName);
   fs.renameSync(finalVideo, outputPath);
 
-  // 7. Cleanup temp files
+  // 6. Cleanup
   [...trimmedPaths, ...scaledPaths, concatenated].forEach(f => {
     try { fs.unlinkSync(f); } catch {}
   });
@@ -222,11 +235,8 @@ async function buildReel({ jobId, clips, music, aspectRatio, clipDuration, pace 
 }
 
 // ── Routes ────────────────────────────────────────────────────
-
-// Health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Upload + start job
 app.post(
   "/api/generate",
   (req, res, next) => { next(); },
@@ -240,30 +250,16 @@ app.post(
       const musicFiles = req.files["music"] || [];
       const music = musicFiles.length > 0 ? musicFiles[0].filename : null;
 
-      if (!clips.length) {
-        return res.status(400).json({ error: "No clips uploaded." });
-      }
+      if (!clips.length) return res.status(400).json({ error: "No clips uploaded." });
 
-      const { aspectRatio = "9:16", pace = "fast" } = req.body;
+      const { aspectRatio = "9:16", pace = "fast", reelDuration = "30" } = req.body;
       const jobId = req.jobId;
 
-      jobs[jobId] = {
-        status: "queued",
-        progress: 0,
-        message: "Job queued...",
-        jobId,
-        outputFile: null,
-      };
-
+      jobs[jobId] = { status: "queued", progress: 0, message: "Job queued...", jobId, outputFile: null };
       res.json({ jobId });
 
-      // Run async (don't await in handler)
-      buildReel({ jobId, clips, music, aspectRatio, pace }).catch(err => {
-        jobs[jobId] = {
-          ...jobs[jobId],
-          status: "error",
-          message: err.message || "Processing failed.",
-        };
+      buildReel({ jobId, clips, music, aspectRatio, pace, reelDuration }).catch(err => {
+        jobs[jobId] = { ...jobs[jobId], status: "error", message: err.message || "Processing failed." };
         console.error("Build error:", err);
       });
     } catch (err) {
@@ -273,23 +269,20 @@ app.post(
   }
 );
 
-// Poll job status
 app.get("/api/status/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).json({ error: "Job not found." });
   res.json(job);
 });
 
-// Download finished reel
 app.get("/api/download/:jobId/:filename", (req, res) => {
   const filePath = path.join(OUTPUT_DIR, req.params.jobId, req.params.filename);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found." });
   res.download(filePath);
 });
 
-// Cleanup old jobs (run every hour)
 setInterval(() => {
-  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2 hours
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   [UPLOAD_DIR, OUTPUT_DIR].forEach(dir => {
     fs.readdirSync(dir).forEach(jobId => {
       const jobDir = path.join(dir, jobId);
