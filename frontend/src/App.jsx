@@ -1,8 +1,3 @@
-bash
-
-cat /home/claude/reel-generator/frontend/src/App.jsx
-Output
-
 import { useState, useRef, useEffect } from "react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:3001";
