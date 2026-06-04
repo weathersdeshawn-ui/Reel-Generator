@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: reel-generator-backend
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+    disk:
+      name: reel-storage
+      mountPath: /app/uploads
+      sizeGB: 10
